@@ -1,0 +1,264 @@
+"""
+Genera el reporte descargable (Excel) de una semana: RESUMEN por tienda
+(solicitado + resultados de validación) y DETALLE del pedido consolidado.
+"""
+import io
+import re
+
+import pandas as pd
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
+
+
+def grupo_semana(week_tag):
+    """Agrupa los week_tag de varios archivos de una misma semana:
+    'W40', 'W401', 'W402' -> 'W40' (letras + 2 dígitos de semana)."""
+    m = re.match(r"^\D*\d{2}", str(week_tag))
+    return m.group(0) if m else str(week_tag)
+
+
+def _ultimo_cierre_por_tienda(historial_rows):
+    """historial_rows: lista de tuplas
+    (week_tag, tienda, fecha_cierre, solicitado_total, tenido_total, faltante_total, devuelto_total)
+    Ya vienen ordenadas por fecha_cierre descendente (más reciente primero),
+    así que basta quedarnos con la primera aparición de cada tienda."""
+    ultimo = {}
+    for row in historial_rows:
+        _, tienda, _fecha, solicitado, tenido, falta, devuelto = row
+        tienda = str(tienda)  # por si acaso llega como número
+        if tienda not in ultimo:
+            ultimo[tienda] = {
+                "solicitado_val": solicitado,
+                "tenido": tenido,
+                "falta": falta,
+                "devuelto": devuelto,
+            }
+    return ultimo
+
+
+def _filas_semana(db, conn, week_tag):
+    """Calcula las filas (resumen, detalle, faltantes) de UN week_tag.
+
+    El detalle solo incluye los códigos que efectivamente se enviaron según
+    la última validación cerrada de cada tienda (tenido > 0), y la cantidad
+    mostrada es la enviada (tenido), no la solicitada originalmente. Las
+    tiendas sin validación cerrada no aparecen en el detalle (nada
+    confirmado como enviado todavía)."""
+    tiendas = db.list_tiendas(conn, week_tag)
+    historial_rows = db.get_historial(conn, week_tag=week_tag)
+    ultimo_cierre = _ultimo_cierre_por_tienda(historial_rows)
+
+    resumen_rows = []
+
+    # Pedido crudo (una fila por línea original) para sacar las columnas
+    # descriptivas (codigo_color, cod, color, id_cabecera, id_linea, etc.).
+    # Nos quedamos con una fila por código+tienda (la primera), ya que la
+    # cantidad real a mostrar viene de la validación, no de estas líneas.
+    detalle_crudo = db.get_pedido_detalle(conn, week_tag)
+    if not detalle_crudo.empty:
+        detalle_crudo = detalle_crudo.drop_duplicates(
+            subset=["codigo_departamento", "codigo"], keep="first"
+        )
+
+    detalle_rows = []
+    faltantes_rows = []
+
+    # Descripción del producto: se cruza por 'codigo' contra el Sheet de
+    # stock del almacén (familia 'LA CARCASA MOVIL'). Si no está disponible
+    # (ej. modo SQLite local, o el sheet externo falla), queda vacío.
+    descripciones = db.get_stock_descripciones() if hasattr(db, "get_stock_descripciones") else {}
+    stock_warning = db.get_stock_error() if hasattr(db, "get_stock_error") else None
+
+    # Una sola lectura del historial completo de la semana (con detalle por
+    # código), en vez de una lectura por tienda — evita agotar la cuota de
+    # la API de Google Sheets cuando hay muchas tiendas.
+    detalle_validacion_por_tienda = db.get_ultimo_detalle_validacion_todas(conn, week_tag)
+
+    for tienda, nombre in tiendas:
+        pedido_map = db.get_pedido_tienda(conn, week_tag, tienda)
+        suma_solicitada = sum(pedido_map.values())
+
+        cierre = ultimo_cierre.get(str(tienda))
+
+        # Detalle de códigos efectivamente enviados (tenido > 0) en la
+        # última validación cerrada de esta tienda.
+        detalle_validacion = detalle_validacion_por_tienda.get(str(tienda))
+
+        # SKU únicos: en base a lo VALIDADO (códigos con tenido > 0 en la
+        # última validación cerrada), no en base al pedido original.
+        cuenta_codigos_validados = None
+        if cierre and detalle_validacion:
+            cuenta_codigos_validados = sum(
+                1 for item in detalle_validacion if (item.get("tenido", 0) or 0) > 0
+            )
+
+        resumen_rows.append(
+            {
+                "codigo_departamento": tienda,
+                "nombre_departamento": nombre,
+                "SKU unicos": cuenta_codigos_validados,
+                "Unidades Solicitadas": suma_solicitada,
+                "Unidades Validadas": cierre["tenido"] if cierre else None,
+                "Unidades Faltantes": cierre["falta"] if cierre else None,
+                "Excedente": cierre["devuelto"] if cierre else None,
+                "Validación cerrada": "Sí" if cierre else "No",
+            }
+        )
+
+        if not detalle_validacion:
+            continue
+
+        for item in detalle_validacion:
+            tenido = item.get("tenido", 0) or 0
+            falta_item = item.get("falta", 0) or 0
+            codigo = str(item.get("codigo")).strip()
+            fila_base = {}
+            if not detalle_crudo.empty:
+                # comparamos siempre como texto (str) por ambos lados: Google
+                # Sheets a veces guarda códigos como número, lo que rompe el
+                # cruce si se compara contra el string tal cual.
+                match = detalle_crudo[
+                    (detalle_crudo["codigo_departamento"].astype(str) == str(tienda))
+                    & (detalle_crudo["codigo"].astype(str) == codigo)
+                ]
+                if not match.empty:
+                    fila_base = match.iloc[0].to_dict()
+
+            # cod/color se recalculan aquí mismo a partir de 'codigo' (que
+            # siempre está correcto y completo, sin punto), en vez de leer
+            # las columnas 'cod'/'color' ya guardadas en pedido_detalle — así
+            # el reporte sale bien de inmediato sin tener que volver a
+            # cargar el pedido cada vez que se ajusta esta regla. Los
+            # primeros 6 caracteres son 'cod' y el resto es 'color' (ej.
+            # '146590056' -> '146590'/'056', '186360U' -> '186360'/'U').
+            cod, color = codigo[:6], codigo[6:]
+            descripcion = descripciones.get(codigo, "")
+
+            if tenido > 0:
+                cantidad_int = int(tenido) if float(tenido).is_integer() else tenido
+                # 'traspaso' se reconstruye con el mismo patrón que usa el sistema
+                # de origen (no viene en el archivo que subes, pero sigue un
+                # formato fijo: "Ubicado P2L;Reparto Salida;{cod};{color};{cantidad};NA")
+                traspaso = f"Ubicado P2L;Reparto Salida;{cod};{color};{cantidad_int};NA" if cod else ""
+
+                detalle_rows.append(
+                    {
+                        "id_cabecera": fila_base.get("id_cabecera", ""),
+                        "id_linea": fila_base.get("id_linea", ""),
+                        "codigo_departamento": tienda,
+                        "nombre_departamento": nombre,
+                        "codigo_color": fila_base.get("codigo_color", codigo),
+                        "codigo": codigo,
+                        "descripcion": descripcion,
+                        "unidades_picking": tenido,
+                        "cabecera_original": fila_base.get("cabecera_original", ""),
+                        "articulo_original": fila_base.get("articulo_original", ""),
+                        "cod": cod,
+                        "color": color,
+                        "traspaso": traspaso,
+                    }
+                )
+
+            if falta_item > 0:
+                faltantes_rows.append(
+                    {
+                        "id_cabecera": fila_base.get("id_cabecera", ""),
+                        "id_linea": fila_base.get("id_linea", ""),
+                        "codigo_departamento": tienda,
+                        "nombre_departamento": nombre,
+                        "codigo_color": fila_base.get("codigo_color", codigo),
+                        "codigo": codigo,
+                        "descripcion": descripcion,
+                        "unidades_faltantes": falta_item,
+                        "cabecera_original": fila_base.get("cabecera_original", ""),
+                        "articulo_original": fila_base.get("articulo_original", ""),
+                        "cod": cod,
+                        "color": color,
+                    }
+                )
+
+    return resumen_rows, detalle_rows, faltantes_rows, stock_warning
+
+
+def generar_reporte(db, conn, week_tags):
+    """Devuelve (bytes_xlsx, resumen_df, detalle_df, stock_warning).
+
+    week_tags puede ser un solo week_tag o una lista (ej. ['W40','W401','W403']
+    = varios archivos de la misma semana): se juntan en un solo reporte."""
+    if isinstance(week_tags, str):
+        week_tags = [week_tags]
+    week_tag = week_tags[0] if len(week_tags) == 1 else grupo_semana(week_tags[0])
+
+    resumen_rows, detalle_rows, faltantes_rows = [], [], []
+    stock_warning = None
+    for wt in week_tags:
+        r, d, f, w = _filas_semana(db, conn, wt)
+        if len(week_tags) > 1:
+            for fila in r:
+                fila["Archivo"] = wt
+        resumen_rows += r
+        detalle_rows += d
+        faltantes_rows += f
+        stock_warning = stock_warning or w
+
+    resumen_df = pd.DataFrame(resumen_rows)
+    detalle_df = pd.DataFrame(
+        detalle_rows,
+        columns=[
+            "id_cabecera", "id_linea", "codigo_departamento", "nombre_departamento",
+            "codigo_color", "codigo", "descripcion", "unidades_picking",
+            "cabecera_original", "articulo_original", "cod", "color", "traspaso",
+        ],
+    )
+    faltantes_df = pd.DataFrame(
+        faltantes_rows,
+        columns=[
+            "id_cabecera", "id_linea", "codigo_departamento", "nombre_departamento",
+            "codigo_color", "codigo", "descripcion", "unidades_faltantes",
+            "cabecera_original", "articulo_original", "cod", "color",
+        ],
+    )
+
+    # Fila de totales generales
+    if not resumen_df.empty:
+        totales = {
+            "codigo_departamento": "Total general",
+            "nombre_departamento": "",
+            "SKU unicos": resumen_df["SKU unicos"].sum(skipna=True),
+            "Unidades Solicitadas": resumen_df["Unidades Solicitadas"].sum(),
+            "Unidades Validadas": resumen_df["Unidades Validadas"].sum(skipna=True),
+            "Unidades Faltantes": resumen_df["Unidades Faltantes"].sum(skipna=True),
+            "Excedente": resumen_df["Excedente"].sum(skipna=True),
+            "Validación cerrada": "",
+        }
+        resumen_df = pd.concat([resumen_df, pd.DataFrame([totales])], ignore_index=True)
+
+    # ------------------------------------------------------------------
+    # Escribir el Excel con formato simple (encabezados en negrita/color)
+    # ------------------------------------------------------------------
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        resumen_df.to_excel(writer, sheet_name="RESUMEN", index=False)
+        detalle_df.to_excel(writer, sheet_name=f"Picking Subcedis {week_tag}", index=False)
+        faltantes_df.to_excel(writer, sheet_name="FALTANTES", index=False)
+
+        header_fill = PatternFill(start_color="D9E1F2", end_color="D9E1F2", fill_type="solid")
+        header_font = Font(bold=True)
+
+        columnas_por_hoja = {
+            "RESUMEN": resumen_df.columns,
+            f"Picking Subcedis {week_tag}": detalle_df.columns,
+            "FALTANTES": faltantes_df.columns,
+        }
+
+        for sheet_name in writer.sheets:
+            ws = writer.sheets[sheet_name]
+            for col_idx, col_name in enumerate(columnas_por_hoja[sheet_name], start=1):
+                cell = ws.cell(row=1, column=col_idx)
+                cell.font = header_font
+                cell.fill = header_fill
+                # ancho de columna aproximado según el contenido
+                width = max(12, len(str(col_name)) + 2)
+                ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    return buffer.getvalue(), resumen_df, detalle_df, stock_warning
