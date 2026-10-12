@@ -621,7 +621,7 @@ def _aviso_excedente(codigo, solicitado, escaneado_total, devuelto_total):
 
 
 @st.dialog("📋 Códigos faltantes", width="large")
-def _ventana_faltantes(tienda_nombre, week_sel, faltantes):
+def _ventana_faltantes(tienda_nombre, week_sel, tienda_sel, faltantes, resumen_rows):
     st.markdown(f"**{tienda_nombre}** — semana {week_sel}")
     info = db.get_stock_info() if hasattr(db, "get_stock_info") else {}
     filas = []
@@ -653,8 +653,33 @@ def _ventana_faltantes(tienda_nombre, week_sel, faltantes):
     st.dataframe(df, use_container_width=True)
     if not info:
         st.warning("No se pudo leer el Sheet de stock: no hay descripción ni ubicación.")
-    if st.button("Cerrar", type="primary", key="cerrar_ventana_faltantes"):
-        st.rerun()
+    st.markdown("---")
+    if not st.session_state.get("confirmando_cierre_faltantes"):
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("⬅ Volver a la validación", key="volver_validacion_faltantes"):
+                st.rerun()
+        with b2:
+            if st.button("🔒 Cerrar y guardar", type="primary", key="cerrar_guardar_faltantes"):
+                st.session_state["confirmando_cierre_faltantes"] = True
+                st.rerun(scope="fragment")
+    else:
+        st.warning(
+            "¿Estás segura? Si todavía hay que revalidar algo, vuelve a la validación. "
+            "Al guardar, la validación de esta tienda queda cerrada en el historial."
+        )
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Sí, guardar", type="primary", key="si_guardar_faltantes"):
+                db.guardar_historial(conn, week_sel, tienda_sel, resumen_rows)
+                st.session_state["escaneo_guardado"] = True
+                st.session_state["confirmando_cierre_faltantes"] = False
+                st.session_state["msg_historial_guardado"] = f"Historial guardado para {tienda_nombre} — semana {week_sel}."
+                st.rerun()
+        with c2:
+            if st.button("No, volver a la validación", key="no_guardar_faltantes"):
+                st.session_state["confirmando_cierre_faltantes"] = False
+                st.rerun()
 
 
 def _hay_validacion_sin_guardar():
@@ -1222,14 +1247,21 @@ elif seccion_activa == "2":
                     )
 
                 st.markdown("")
+                msg_guardado = st.session_state.pop("msg_historial_guardado", None)
+                if msg_guardado:
+                    st.success(msg_guardado)
+                    st.balloons()
                 if st.button("🔒 Cerrar validación y guardar en historial", type="primary"):
-                    db.guardar_historial(conn, week_sel, tienda_sel, resumen_rows)
-                    st.session_state["escaneo_guardado"] = True
-                    st.success(f"Historial guardado para {tienda_nombre} — semana {week_sel}.")
                     faltantes_cierre = [r for r in resumen_rows if (r["falta"] or 0) > 0]
                     if faltantes_cierre:
-                        _ventana_faltantes(tienda_nombre, week_sel, faltantes_cierre)
+                        # con faltantes: primero se muestra la ventana de revisión;
+                        # NO se guarda hasta que confirme ahí mismo.
+                        st.session_state["confirmando_cierre_faltantes"] = False
+                        _ventana_faltantes(tienda_nombre, week_sel, tienda_sel, faltantes_cierre, resumen_rows)
                     else:
+                        db.guardar_historial(conn, week_sel, tienda_sel, resumen_rows)
+                        st.session_state["escaneo_guardado"] = True
+                        st.success(f"Historial guardado para {tienda_nombre} — semana {week_sel}.")
                         st.balloons()
             else:
                 st.info("No hay items en el pedido para esta tienda.")
