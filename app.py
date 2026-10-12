@@ -815,6 +815,33 @@ elif seccion_activa == "1":
         except Exception as e:
             st.error(f"Error al leer el archivo: {e}")
         else:
+            # ---- Validación de coherencia código de tienda <-> nombre ----
+            # Un nombre debe tener UN solo código y un código UN solo nombre
+            # (error típico: arrastrar la celda en Excel y que el código salga correlativo).
+            _tn = consolidado[["tienda", "nombre_tienda"]].drop_duplicates()
+            _problemas = []
+            _por_nombre = _tn.groupby("nombre_tienda")["tienda"].apply(list)
+            for _nombre, _codigos in _por_nombre.items():
+                if len(_codigos) > 1:
+                    _problemas.append(
+                        f"- El nombre **{_nombre}** aparece con {len(_codigos)} códigos distintos: "
+                        + ", ".join(str(c) for c in _codigos[:15]) + ("…" if len(_codigos) > 15 else "")
+                    )
+            _por_codigo = _tn.groupby("tienda")["nombre_tienda"].apply(list)
+            for _codigo, _nombres in _por_codigo.items():
+                if len(_nombres) > 1:
+                    _problemas.append(
+                        f"- El código **{_codigo}** aparece con {len(_nombres)} nombres distintos: "
+                        + " / ".join(str(n) for n in _nombres[:10]) + ("…" if len(_nombres) > 10 else "")
+                    )
+            if _problemas:
+                st.error(
+                    "⛔ El pedido NO se cargó: hay tiendas inconsistentes en las columnas "
+                    "`codigo_departamento` / `nombre_departamento`. Corrige el Excel y vuelve a subirlo.\n\n"
+                    + "\n".join(_problemas)
+                )
+                st.stop()
+
             st.success(f"Semana detectada: **{week_tag}** — {consolidado['tienda'].nunique()} tiendas, "
                        f"{len(consolidado)} lineas consolidadas (código único por tienda).")
 
